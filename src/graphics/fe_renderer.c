@@ -1,4 +1,4 @@
-#include "graphics/renderer/fe_renderer.h"
+#include "graphics/fe_renderer.h"
 #include "core/utils/fe_logger.h"
 #include "core/memory/fe_memory_manager.h" // Bellek yönetimi için
 // Diğer render bileşenleri için başlıklar (gelecekte eklenecek)
