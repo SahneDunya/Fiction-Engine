@@ -1,6 +1,6 @@
 #include "graphics/render_pass/fe_render_pass.h"
-#include "core/utils/fe_logger.h"
-#include "core/memory/fe_memory_manager.h" // Bellek tahsisi için
+#include "include/utils/fe_logger.h"
+#include "include/memory/fe_memory_manager.h" // Bellek tahsisi için
 
 // --- API'ya Özgü Render Pass Başlıkları (İleri Bildirimler) ---
 // Bu, fe_vk_render_pass.h'te tanımlanan gerçek Vulkan implementasyonunu çağıracaktır.
