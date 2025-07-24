@@ -1,261 +1,576 @@
-#include "physics/fe_physics_manager.h"
-#include "core/utils/fe_logger.h"
-#include "core/memory/fe_memory_manager.h"
-#include "core/math/fe_math.h" // fe_vec3_normalize vb. için
+#include "fe_physics_manager.h"
+#include <stdio.h>    // printf için
+#include <stdlib.h>   // malloc, free için
+#include <string.h>   // memset için
+#include <math.h>     // sqrt, fabsf vb. için
 
-// --- Global Fizik Yönetici Durumu (Singleton) ---
-static fe_physics_manager_state_t g_physics_manager_state;
+// --- Dahili Global Değişkenler ---
+// Bu değişkenler, fizik yöneticisinin durumunu tutar
+static struct {
+    vec3 gravity;                  // Yerçekimi vektörü
+    FeRigidbody** rigidbodies;     // Tüm rijit cisimlerin listesi (dynamik dizi)
+    unsigned int numRigidbodies;   // Mevcut rijit cisim sayısı
+    unsigned int maxRigidbodies;   // Maksimum rijit cisim sayısı
+    unsigned int nextRigidbodyId;  // Bir sonraki rijit cisim ID'si
+
+    // Çarpışma bilgi depolaması
+    FeCollisionInfo* collisionInfos; // Bu adımdaki tüm çarpışmaların listesi
+    unsigned int numCollisionInfos;  // Mevcut çarpışma sayısı
+    unsigned int maxCollisionInfos;  // Maksimum çarpışma sayısı (çift sayısı)
+
+    bool initialized;              // Yöneticinin başlatılıp başlatılmadığı
+} g_PhysicsManager;
 
 // --- Dahili Yardımcı Fonksiyonlar ---
 
-// Chaos'tan gelen çarpışma olaylarını Fiction Engine'ın geri çağırma sistemine dönüştüren Mock fonksiyonlar.
-// Gerçek Chaos entegrasyonunda, Chaos'un kendi event listener mekanizmaları bu fonksiyonları çağıracaktır.
+// Rijit cisimlerin güncellenmesi (konum, hız, ivme)
+static void feIntegrateRigidbodies(float deltaTime) {
+    // Verle entegrasyonu (daha stabil)
+    for (unsigned int i = 0; i < g_PhysicsManager.numRigidbodies; ++i) {
+        FeRigidbody* rb = g_PhysicsManager.rigidbodies[i];
+        if (!rb->isActive || rb->isStatic) continue;
 
-// Bu fonksiyonlar, Chaos'un dahili geri çağrılarında tetiklenecek ve ardından
-// Fiction Engine'ın kayıtlı geri çağırmalarını çağıracaktır.
-// NOT: Chaos'un event yapısı karmaşık olabilir. Bu sadece bir basitleştirilmiş örnektir.
+        // Doğrusal ivme hesaplama
+        vec3 linearAcceleration;
+        glm_vec3_scale(g_PhysicsManager.gravity, rb->useGravity ? 1.0f : 0.0f, linearAcceleration); // Yerçekimi
+        glm_vec3_muladds(rb->forceAccumulator, rb->inverseMass, linearAcceleration); // Uygulanan kuvvetler
 
-static void fe_physics_manager_chaos_on_collision_enter(void* chaos_body_handle1, void* chaos_body_handle2,
-                                                       fe_vec3 contact_point, fe_vec3 normal, float impulse) {
-    if (!g_physics_manager_state.is_initialized) return;
+        // Açısal ivme hesaplama
+        vec3 angularAcceleration;
+        glm_mat4_mulv3(rb->inverseInertiaTensor, rb->torqueAccumulator, 1.0f, angularAcceleration);
 
-    // Chaos tutaçlarından Fiction Engine'ın fe_chaos_rigid_body_t nesnelerini bul.
-    // Bu, Chaos'un API'si aracılığıyla yapılmalıdır. Örneğin:
-    // FChaosPhysicsActor* actor1 = (FChaosPhysicsActor*)chaos_body_handle1;
-    // FChaosPhysicsActor* actor2 = (FChaosPhysicsActor*)chaos_body_handle2;
-    // fe_chaos_rigid_body_t* body1 = (fe_chaos_rigid_body_t*)actor1->GetUserData(); // Eğer user_data'yı set ettiysek
-    // fe_chaos_rigid_body_t* body2 = (fe_chaos_rigid_body_t*)actor2->GetUserData();
-    
-    // Geçici Mock:
-    fe_chaos_rigid_body_t mock_body1;
-    memset(&mock_body1, 0, sizeof(fe_chaos_rigid_body_t));
-    fe_string_init(&mock_body1.id, "MockBodyA");
-    mock_body1.chaos_actor_handle = chaos_body_handle1;
+        // Hız güncelleme (v += a * dt)
+        glm_vec3_muladds(linearAcceleration, deltaTime, rb->linearVelocity);
+        glm_vec3_muladds(angularAcceleration, deltaTime, rb->angularVelocity);
 
-    fe_chaos_rigid_body_t mock_body2;
-    memset(&mock_body2, 0, sizeof(fe_chaos_rigid_body_t));
-    fe_string_init(&mock_body2.id, "MockBodyB");
-    mock_body2.chaos_actor_handle = chaos_body_handle2;
+        // Sürtünme veya sönümleme (damping) eklemek isteyebilirsiniz
+        // glm_vec3_scale(rb->linearVelocity, powf(0.99, deltaTime), rb->linearVelocity);
+        // glm_vec3_scale(rb->angularVelocity, powf(0.98, deltaTime), rb->angularVelocity);
 
-    if (g_physics_manager_state.on_collision_enter_cb) {
-        g_physics_manager_state.on_collision_enter_cb(&mock_body1, &mock_body2, contact_point, normal, impulse);
+        // Konum güncelleme (p += v * dt)
+        glm_vec3_muladds(rb->linearVelocity, deltaTime, rb->position);
+
+        // Dönüş güncelleme (quaternion ile)
+        versor q_delta;
+        // q_delta = 0.5 * angularVelocity * rotation
+        glm_quat_init(q_delta, 0.5f * rb->angularVelocity[0], 0.5f * rb->angularVelocity[1], 0.5f * rb->angularVelocity[2], 0.0f);
+        glm_quat_mul(q_delta, rb->rotation, q_delta); // q_delta = q_delta * rb->rotation
+        glm_quat_muladds(q_delta, deltaTime, rb->rotation); // rb->rotation += q_delta * deltaTime
+        glm_quat_normalize(rb->rotation); // Normalleştirme önemli!
+
+        // Akümülatörleri sıfırla
+        glm_vec3_zero(rb->forceAccumulator);
+        glm_vec3_zero(rb->torqueAccumulator);
     }
-    fe_string_destroy(&mock_body1.id);
-    fe_string_destroy(&mock_body2.id);
 }
 
-static void fe_physics_manager_chaos_on_collision_stay(void* chaos_body_handle1, void* chaos_body_handle2,
-                                                      fe_vec3 contact_point, fe_vec3 normal) {
-    if (!g_physics_manager_state.is_initialized) return;
+// Tüm olası çarpışma çiftlerini test eder
+static void feBroadPhase() {
+    g_PhysicsManager.numCollisionInfos = 0; // Bir önceki adımdaki çarpışmaları temizle
 
-    // Gerçek Chaos entegrasyonunda benzer şekilde fe_chaos_rigid_body_t'ler bulunmalı
-    // Geçici Mock:
-    fe_chaos_rigid_body_t mock_body1;
-    memset(&mock_body1, 0, sizeof(fe_chaos_rigid_body_t));
-    fe_string_init(&mock_body1.id, "MockBodyA");
-    mock_body1.chaos_actor_handle = chaos_body_handle1;
+    for (unsigned int i = 0; i < g_PhysicsManager.numRigidbodies; ++i) {
+        for (unsigned int j = i + 1; j < g_PhysicsManager.numRigidbodies; ++j) {
+            FeRigidbody* rbA = g_PhysicsManager.rigidbodies[i];
+            FeRigidbody* rbB = g_PhysicsManager.rigidbodies[j];
 
-    fe_chaos_rigid_body_t mock_body2;
-    memset(&mock_body2, 0, sizeof(fe_chaos_rigid_body_t));
-    fe_string_init(&mock_body2.id, "MockBodyB");
-    mock_body2.chaos_actor_handle = chaos_body_handle2;
+            // Her iki cisim de aktif ve statik değilse veya biri statik diğeri aktifse
+            if ((!rbA->isActive || !rbB->isActive) || (rbA->isStatic && rbB->isStatic)) {
+                continue;
+            }
 
-    if (g_physics_manager_state.on_collision_stay_cb) {
-        g_physics_manager_state.on_collision_stay_cb(&mock_body1, &mock_body2, contact_point, normal);
+            // Çarpışma türüne göre uygun tespit fonksiyonunu çağır
+            bool collisionDetected = false;
+            FeCollisionInfo currentCollision;
+            currentCollision.rbA = rbA;
+            currentCollision.rbB = rbB;
+
+            // TODO: Daha genel bir çarpışma tespit sistemi kurulmalı (Dispatch Table veya switch/case)
+            // Şimdilik sadece küre-küre çarpışmasını örnekleyelim
+            if (rbA->collider.type == FE_COLLIDER_SPHERE && rbB->collider.type == FE_COLLIDER_SPHERE) {
+                collisionDetected = feDetectCollision_SphereSphere(rbA, rbB, &currentCollision);
+            } else if (rbA->collider.type == FE_COLLIDER_BOX && rbB->collider.type == FE_COLLIDER_BOX) {
+                collisionDetected = feDetectCollision_BoxBox(rbA, rbB, &currentCollision);
+            } else if ((rbA->collider.type == FE_COLLIDER_SPHERE && rbB->collider.type == FE_COLLIDER_BOX) ||
+                       (rbA->collider.type == FE_COLLIDER_BOX && rbB->collider.type == FE_COLLIDER_SPHERE)) {
+                // Sphere-Box çarpışması için sırayı standardize et
+                if (rbA->collider.type == FE_COLLIDER_BOX) {
+                    FeRigidbody* temp = rbA;
+                    rbA = rbB;
+                    rbB = temp;
+                    // temp_rb_A ve temp_rb_B'yi kullanarak info'yu doldururken dikkat edin.
+                    currentCollision.rbA = rbA; // Güncellenmiş rbA (sphere)
+                    currentCollision.rbB = rbB; // Güncellenmiş rbB (box)
+                }
+                collisionDetected = feDetectCollision_SphereBox(rbA, rbB, &currentCollision);
+            }
+            // Diğer çarpışma kombinasyonları buraya eklenecek
+
+            if (collisionDetected) {
+                if (g_PhysicsManager.numCollisionInfos < g_PhysicsManager.maxCollisionInfos) {
+                    g_PhysicsManager.collisionInfos[g_PhysicsManager.numCollisionInfos++] = currentCollision;
+                } else {
+                    fprintf(stderr, "Uyarı: Maksimum çarpışma sayısı aşıldı! Bazı çarpışmalar göz ardı edilebilir.\n");
+                }
+            }
+        }
     }
-    fe_string_destroy(&mock_body1.id);
-    fe_string_destroy(&mock_body2.id);
 }
 
-static void fe_physics_manager_chaos_on_collision_exit(void* chaos_body_handle1, void* chaos_body_handle2) {
-    if (!g_physics_manager_state.is_initialized) return;
-
-    // Gerçek Chaos entegrasyonunda benzer şekilde fe_chaos_rigid_body_t'ler bulunmalı
-    // Geçici Mock:
-    fe_chaos_rigid_body_t mock_body1;
-    memset(&mock_body1, 0, sizeof(fe_chaos_rigid_body_t));
-    fe_string_init(&mock_body1.id, "MockBodyA");
-    mock_body1.chaos_actor_handle = chaos_body_handle1;
-
-    fe_chaos_rigid_body_t mock_body2;
-    memset(&mock_body2, 0, sizeof(fe_chaos_rigid_body_t));
-    fe_string_init(&mock_body2.id, "MockBodyB");
-    mock_body2.chaos_actor_handle = chaos_body_handle2;
-
-    if (g_physics_manager_state.on_collision_exit_cb) {
-        g_physics_manager_state.on_collision_exit_cb(&mock_body1, &mock_body2);
+// Çarpışmaları çözümler (penetrasyon ve impuls)
+static void feNarrowPhaseAndResolution() {
+    for (unsigned int i = 0; i < g_PhysicsManager.numCollisionInfos; ++i) {
+        feResolveCollision(&g_PhysicsManager.collisionInfos[i]);
     }
-    fe_string_destroy(&mock_body1.id);
-    fe_string_destroy(&mock_body2.id);
 }
 
 
-// --- Fonksiyon Uygulamaları ---
+// --- API Fonksiyon Uygulamaları ---
 
-fe_physics_manager_error_t fe_physics_manager_init(fe_vec3 gravity, float fixed_timestep) {
-    if (g_physics_manager_state.is_initialized) {
-        FE_LOG_WARN("Physics manager already initialized.");
-        return FE_PHYSICS_MANAGER_ALREADY_INITIALIZED;
-    }
-
-    // Chaos World'ü başlat
-    fe_chaos_error_t chaos_err = fe_chaos_world_init(gravity);
-    if (chaos_err != FE_CHAOS_SUCCESS) {
-        FE_LOG_CRITICAL("Failed to initialize Chaos World: %d", chaos_err);
-        return FE_PHYSICS_MANAGER_CHAOS_ERROR;
-    }
-
-    g_physics_manager_state.fixed_timestep = fixed_timestep;
-    g_physics_manager_state.accumulator = 0.0f;
-    g_physics_manager_state.on_collision_enter_cb = NULL;
-    g_physics_manager_state.on_collision_stay_cb = NULL;
-    g_physics_manager_state.on_collision_exit_cb = NULL;
-
-    g_physics_manager_state.is_initialized = true;
-    FE_LOG_INFO("Physics manager initialized with fixed timestep: %.4f", fixed_timestep);
-
-    // TODO: Gerçek Chaos entegrasyonunda, Chaos'un olay sistemine bu geri çağırma fonksiyonlarını kaydet.
-    // Örneğin: FChaosScene::RegisterCollisionCallback(fe_physics_manager_chaos_on_collision_enter);
-    // Veya Chaos'tan gelen olayları ana döngüde çekip işleyen bir sistem kurulmalı.
-
-    return FE_PHYSICS_MANAGER_SUCCESS;
-}
-
-void fe_physics_manager_shutdown() {
-    if (!g_physics_manager_state.is_initialized) {
-        FE_LOG_WARN("Physics manager not initialized. Nothing to shutdown.");
+void fePhysicsManagerInit(unsigned int collisionPairsCapacity, unsigned int maxRigidbodies) {
+    if (g_PhysicsManager.initialized) {
+        fprintf(stderr, "Fizik yöneticisi zaten başlatıldı.\n");
         return;
     }
 
-    // Chaos World'ü kapat
-    fe_chaos_world_shutdown();
+    g_PhysicsManager.gravity[0] = 0.0f;
+    g_PhysicsManager.gravity[1] = -9.81f; // Varsayılan yerçekimi (Y ekseni aşağı)
+    g_PhysicsManager.gravity[2] = 0.0f;
 
-    g_physics_manager_state.is_initialized = false;
-    g_physics_manager_state.fixed_timestep = 0.0f;
-    g_physics_manager_state.accumulator = 0.0f;
-    g_physics_manager_state.on_collision_enter_cb = NULL;
-    g_physics_manager_state.on_collision_stay_cb = NULL;
-    g_physics_manager_state.on_collision_exit_cb = NULL;
+    g_PhysicsManager.maxRigidbodies = maxRigidbodies;
+    g_PhysicsManager.rigidbodies = (FeRigidbody**)malloc(sizeof(FeRigidbody*) * maxRigidbodies);
+    if (!g_PhysicsManager.rigidbodies) {
+        fprintf(stderr, "Hata: Rijit cisimler için bellek ayrılamadı.\n");
+        exit(EXIT_FAILURE);
+    }
+    g_PhysicsManager.numRigidbodies = 0;
+    g_PhysicsManager.nextRigidbodyId = 0;
 
-    FE_LOG_INFO("Physics manager shutdown complete.");
+    g_PhysicsManager.maxCollisionInfos = collisionPairsCapacity;
+    g_PhysicsManager.collisionInfos = (FeCollisionInfo*)malloc(sizeof(FeCollisionInfo) * collisionPairsCapacity);
+    if (!g_PhysicsManager.collisionInfos) {
+        fprintf(stderr, "Hata: Çarpışma bilgileri için bellek ayrılamadı.\n");
+        free(g_PhysicsManager.rigidbodies);
+        exit(EXIT_FAILURE);
+    }
+    g_PhysicsManager.numCollisionInfos = 0;
+
+    g_PhysicsManager.initialized = true;
+    printf("Fizik Yöneticisi başarıyla başlatıldı.\n");
 }
 
-fe_physics_manager_error_t fe_physics_manager_update(float delta_time) {
-    if (!g_physics_manager_state.is_initialized) {
-        FE_LOG_ERROR("Physics manager not initialized. Cannot update physics.");
-        return FE_PHYSICS_MANAGER_NOT_INITIALIZED;
+void fePhysicsManagerShutdown() {
+    if (!g_PhysicsManager.initialized) {
+        fprintf(stderr, "Fizik yöneticisi başlatılmadı.\n");
+        return;
     }
 
-    g_physics_manager_state.accumulator += delta_time;
-
-    // Sabit zaman adımlarıyla fizik simülasyonunu ilerlet
-    while (g_physics_manager_state.accumulator >= g_physics_manager_state.fixed_timestep) {
-        fe_chaos_error_t chaos_err = fe_chaos_world_update(g_physics_manager_state.fixed_timestep);
-        if (chaos_err != FE_CHAOS_SUCCESS) {
-            FE_LOG_ERROR("Error updating Chaos world: %d", chaos_err);
-            return FE_PHYSICS_MANAGER_CHAOS_ERROR;
-        }
-        g_physics_manager_state.accumulator -= g_physics_manager_state.fixed_timestep;
+    // Tüm rijit cisimleri serbest bırak
+    for (unsigned int i = 0; i < g_PhysicsManager.numRigidbodies; ++i) {
+        free(g_PhysicsManager.rigidbodies[i]);
     }
+    free(g_PhysicsManager.rigidbodies);
+    g_PhysicsManager.rigidbodies = NULL;
+    g_PhysicsManager.numRigidbodies = 0;
 
-    // TODO: Burada simülasyon sonrası gerekli olan işlevler olabilir.
-    // Örneğin, Chaos'tan güncel transformları çekmek ve oyun nesnelerine dağıtmak.
-    // Bu, genellikle her oyun nesnesinin kendi fizik bileşeni tarafından yapılır,
-    // ancak merkezi bir senkronizasyon noktası da burada olabilir.
+    free(g_PhysicsManager.collisionInfos);
+    g_PhysicsManager.collisionInfos = NULL;
+    g_PhysicsManager.numCollisionInfos = 0;
+    g_PhysicsManager.maxCollisionInfos = 0;
 
-    return FE_PHYSICS_MANAGER_SUCCESS;
+    g_PhysicsManager.initialized = false;
+    printf("Fizik Yöneticisi kapatıldı.\n");
 }
 
-void fe_physics_manager_register_on_collision_enter(fe_on_collision_enter_callback_t callback) {
-    g_physics_manager_state.on_collision_enter_cb = callback;
-    FE_LOG_DEBUG("OnCollisionEnter callback registered.");
-}
-
-void fe_physics_manager_register_on_collision_stay(fe_on_collision_stay_callback_t callback) {
-    g_physics_manager_state.on_collision_stay_cb = callback;
-    FE_LOG_DEBUG("OnCollisionStay callback registered.");
-}
-
-void fe_physics_manager_register_on_collision_exit(fe_on_collision_exit_callback_t callback) {
-    g_physics_manager_state.on_collision_exit_cb = callback;
-    FE_LOG_DEBUG("OnCollisionExit callback registered.");
-}
-
-fe_physics_manager_error_t fe_physics_manager_set_rigid_body_user_data(const char* body_id, void* user_data) {
-    fe_chaos_rigid_body_t* body = fe_chaos_world_get_rigid_body(body_id);
-    if (!body) {
-        FE_LOG_ERROR("Rigid body with ID '%s' not found to set user data.", body_id);
-        return FE_PHYSICS_MANAGER_BODY_NOT_FOUND;
+void fePhysicsManagerSetGravity(vec3 gravity) {
+    if (!g_PhysicsManager.initialized) {
+        fprintf(stderr, "Fizik yöneticisi başlatılmadı. Yerçekimi ayarlanamaz.\n");
+        return;
     }
-    body->user_data = user_data;
-    // TODO: Chaos API'sinde de user_data'yı set etmek gerekebilir.
-    // FChaosPhysicsActor* actor = (FChaosPhysicsActor*)body->chaos_actor_handle;
-    // actor->SetUserData(user_data);
-    FE_LOG_DEBUG("User data set for rigid body '%s'.", body_id);
-    return FE_PHYSICS_MANAGER_SUCCESS;
+    glm_vec3_copy(gravity, g_PhysicsManager.gravity);
 }
 
-void* fe_physics_manager_get_rigid_body_user_data(const char* body_id) {
-    fe_chaos_rigid_body_t* body = fe_chaos_world_get_rigid_body(body_id);
-    if (!body) {
-        FE_LOG_WARN("Rigid body with ID '%s' not found to get user data.", body_id);
+FeRigidbody* fePhysicsManagerCreateRigidbody(vec3 position, versor rotation, float mass, FeCollider collider, bool isStatic, bool useGravity) {
+    if (!g_PhysicsManager.initialized) {
+        fprintf(stderr, "Hata: Fizik yöneticisi başlatılmadı. Rijit cisim oluşturulamıyor.\n");
         return NULL;
     }
-    return body->user_data;
+    if (g_PhysicsManager.numRigidbodies >= g_PhysicsManager.maxRigidbodies) {
+        fprintf(stderr, "Hata: Maksimum rijit cisim sayısına ulaşıldı (%d).\n", g_PhysicsManager.maxRigidbodies);
+        return NULL;
+    }
+
+    FeRigidbody* newRb = (FeRigidbody*)malloc(sizeof(FeRigidbody));
+    if (!newRb) {
+        fprintf(stderr, "Hata: Rijit cisim için bellek ayrılamadı.\n");
+        return NULL;
+    }
+
+    memset(newRb, 0, sizeof(FeRigidbody)); // Belleği sıfırla
+
+    newRb->id = g_PhysicsManager.nextRigidbodyId++;
+    newRb->isActive = true;
+    newRb->isStatic = isStatic;
+    newRb->useGravity = useGravity;
+
+    glm_vec3_copy(position, newRb->position);
+    glm_quat_copy(rotation, newRb->rotation);
+
+    glm_vec3_zero(newRb->linearVelocity);
+    glm_vec3_zero(newRb->angularVelocity);
+
+    newRb->mass = isStatic ? 0.0f : mass; // Statik cisimlerin kütlesi sonsuzdur (veya 0 ters kütle)
+    newRb->inverseMass = isStatic ? 0.0f : (1.0f / mass);
+
+    // Collider'ı kopyala
+    newRb->collider = collider;
+
+    // Eylemsizlik tensörünü hesapla (şimdilik basit bir varsayılan)
+    feRigidbodyCalculateInertiaTensor(newRb);
+
+    glm_vec3_zero(newRb->forceAccumulator);
+    glm_vec3_zero(newRb->torqueAccumulator);
+
+    g_PhysicsManager.rigidbodies[g_PhysicsManager.numRigidbodies++] = newRb;
+    printf("Rijit cisim %d oluşturuldu (Kütle: %.2f, Statik: %s)\n", newRb->id, newRb->mass, newRb->isStatic ? "Evet" : "Hayır");
+    return newRb;
 }
 
-fe_physics_manager_error_t fe_physics_manager_raycast(
-    fe_vec3 origin,
-    fe_vec3 direction,
-    float max_distance,
-    fe_raycast_hit_t* out_hit,
-    uint32_t collision_mask
-) {
-    if (!g_physics_manager_state.is_initialized) {
-        FE_LOG_ERROR("Physics manager not initialized. Cannot perform raycast.");
-        return FE_PHYSICS_MANAGER_NOT_INITIALIZED;
+void fePhysicsManagerRemoveRigidbody(FeRigidbody* rb) {
+    if (!g_PhysicsManager.initialized) {
+        fprintf(stderr, "Fizik yöneticisi başlatılmadı.\n");
+        return;
     }
-    if (!out_hit) {
-        FE_LOG_ERROR("Raycast: out_hit pointer is NULL.");
-        return FE_PHYSICS_MANAGER_INVALID_ARGUMENT;
-    }
+    if (!rb) return;
 
-    memset(out_hit, 0, sizeof(fe_raycast_hit_t));
-    out_hit->hit = false;
+    // Rijit cismi listeden bul ve kaldır
+    for (unsigned int i = 0; i < g_PhysicsManager.numRigidbodies; ++i) {
+        if (g_PhysicsManager.rigidbodies[i]->id == rb->id) {
+            free(g_PhysicsManager.rigidbodies[i]); // Belleği serbest bırak
 
-    // Yön vektörünü normalize etmeyi unutma
-    fe_vec3_normalize(&direction);
-
-    // TODO: Gerçek Chaos API'si ile raycast işlemi yap.
-    // Chaos'un kendi raycast fonksiyonunu çağır:
-    // Örneğin: bool bHit = FChaosScene::Raycast(ConvertFromFeVec3(origin), ConvertFromFeVec3(direction), max_distance, /*out_hit_info*/, collision_mask);
-    // Bu bHit'e ve out_hit_info'ya göre out_hit yapısını doldur.
-    
-    // Mock Raycast Sonucu (her zaman bir şeye vursun ve rastgele bir nokta/normal döndürsün)
-    // Gerçek raycast'te, en yakın isabet döndürülür.
-    if (rand() % 2 == 0) { // %50 ihtimalle isabet
-        out_hit->hit = true;
-        out_hit->distance = max_distance * ((float)rand() / RAND_MAX); // Rastgele bir uzaklık
-        out_hit->position = fe_vec3_add(origin, fe_vec3_mul_scalar(direction, out_hit->distance));
-        out_hit->normal = (fe_vec3){ (float)rand()/RAND_MAX * 2 - 1, (float)rand()/RAND_MAX * 2 - 1, (float)rand()/RAND_MAX * 2 - 1 };
-        fe_vec3_normalize(&out_hit->normal);
-
-        // Mock bir cisim bul ve user_data ata (gerçekte Chaos'tan gelen body'i kullanacağız)
-        fe_chaos_rigid_body_t* mock_body = fe_chaos_world_get_rigid_body("PlayerRigidBody"); // Örnek için bir ID
-        if (mock_body) {
-            out_hit->body = mock_body;
-            out_hit->user_data = mock_body->user_data;
-        } else {
-             // Hiçbir body bulunamazsa, sadece hit bilgisi döneriz.
-             // Veya özel bir "varsayılan zemin" cismi döndürülebilir.
-             out_hit->body = NULL;
-             out_hit->user_data = NULL;
+            // Diziyi kaydır
+            for (unsigned int j = i; j < g_PhysicsManager.numRigidbodies - 1; ++j) {
+                g_PhysicsManager.rigidbodies[j] = g_PhysicsManager.rigidbodies[j + 1];
+            }
+            g_PhysicsManager.numRigidbodies--;
+            printf("Rijit cisim %d kaldırıldı.\n", rb->id);
+            return;
         }
-        FE_LOG_DEBUG("Raycast hit detected at (%.2f, %.2f, %.2f) with distance %.2f.", 
-                     out_hit->position.x, out_hit->position.y, out_hit->position.z, out_hit->distance);
-    } else {
-        FE_LOG_DEBUG("Raycast did not hit anything.");
     }
-    
-    return FE_PHYSICS_MANAGER_SUCCESS;
+    fprintf(stderr, "Uyarı: Rijit cisim %d bulunamadı veya zaten kaldırılmış.\n", rb->id);
+}
+
+void fePhysicsManagerUpdate(float deltaTime) {
+    if (!g_PhysicsManager.initialized) {
+        fprintf(stderr, "Hata: Fizik yöneticisi başlatılmadı. Güncelleme yapılamıyor.\n");
+        return;
+    }
+    if (deltaTime <= 0.0f) return;
+
+    // 1. Rijit cisimleri entegre et (konum ve hızları güncelle)
+    feIntegrateRigidbodies(deltaTime);
+
+    // 2. Geniş Faz Çarpışma Tespiti (Broad-Phase) - Olası çarpışma çiftlerini bul
+    feBroadPhase();
+
+    // 3. Dar Faz Çarpışma Tespiti ve Çözümlemesi (Narrow-Phase & Resolution) - Çarpışma bilgilerini oluştur ve çöz
+    // Penetrasyonu giderme (Position correction)
+    // İteratif bir yaklaşım, daha kararlı sonuçlar verir.
+    // Projelerde yaygın olarak birkaç iterasyon kullanılır (örn: 5-10)
+    const int positionCorrectionIterations = 5;
+    for (int iter = 0; iter < positionCorrectionIterations; ++iter) {
+        // Sadece penetrasyonu düzeltmek için (çarpışma impulsu uygulanmaz)
+        for (unsigned int i = 0; i < g_PhysicsManager.numCollisionInfos; ++i) {
+             FeCollisionInfo* collision = &g_PhysicsManager.collisionInfos[i];
+             // Penetrasyon giderme
+             const float slop = 0.01f; // Küçük bir boşluk bırakarak titremeyi engeller
+             const float percent = 0.4f; // Düzeltmenin yüzde kaçı uygulansın
+             vec3 correction;
+             glm_vec3_scale(collision->normal, fmaxf(collision->penetrationDepth - slop, 0.0f) * percent, correction);
+
+             if (!collision->rbA->isStatic) {
+                 glm_vec3_muladds(correction, -0.5f, collision->rbA->position);
+             }
+             if (!collision->rbB->isStatic) {
+                 glm_vec3_muladds(correction, 0.5f, collision->rbB->position);
+             }
+        }
+    }
+
+
+    // Impuls tabanlı çarpışma çözümlemesi (hızları güncelleme)
+    const int velocityIterations = 10; // Genellikle daha fazla iterasyon gerektirir
+    for (int iter = 0; iter < velocityIterations; ++iter) {
+         for (unsigned int i = 0; i < g_PhysicsManager.numCollisionInfos; ++i) {
+            feResolveCollision(&g_PhysicsManager.collisionInfos[i]);
+         }
+    }
+
+
+    // TODO: Bir çarpışma dinleyicisi veya geri çağırma (callback) mekanizması ekleyebilirsiniz
+    // fePhysicsManagerOnCollision(collisionInfo);
+}
+
+void feRigidbodyApplyForce(FeRigidbody* rb, vec3 force) {
+    if (!rb || rb->isStatic) return;
+    glm_vec3_add(rb->forceAccumulator, force, rb->forceAccumulator);
+}
+
+void feRigidbodyApplyForceAtPoint(FeRigidbody* rb, vec3 force, vec3 point) {
+    if (!rb || rb->isStatic) return;
+
+    feRigidbodyApplyForce(rb, force); // Doğrusal kuvvet
+
+    // Tork hesapla: r x F
+    vec3 r; // Cismin merkezinden kuvvetin uygulama noktasına vektör
+    glm_vec3_sub(point, rb->position, r);
+    vec3 torque;
+    glm_vec3_cross(r, force, torque);
+    feRigidbodyApplyTorque(rb, torque);
+}
+
+void feRigidbodyApplyTorque(FeRigidbody* rb, vec3 torque) {
+    if (!rb || rb->isStatic) return;
+    glm_vec3_add(rb->torqueAccumulator, torque, rb->torqueAccumulator);
+}
+
+void feRigidbodyCalculateInertiaTensor(FeRigidbody* rb) {
+    // Statik cisimlerin eylemsizlik tensörü sonsuzdur (tersi 0)
+    if (rb->isStatic) {
+        glm_mat4_zero(rb->inverseInertiaTensor);
+        return;
+    }
+
+    // Basit geometriler için eylemsizlik tensörü hesaplaması
+    mat4 inertiaTensor; // Eylemsizlik tensörü
+
+    switch (rb->collider.type) {
+        case FE_COLLIDER_SPHERE: {
+            float I = (2.0f / 5.0f) * rb->mass * (rb->collider.shape.sphere.radius * rb->collider.shape.sphere.radius);
+            glm_mat4_identity(inertiaTensor);
+            inertiaTensor[0][0] = I;
+            inertiaTensor[1][1] = I;
+            inertiaTensor[2][2] = I;
+            break;
+        }
+        case FE_COLLIDER_BOX: {
+            vec3 halfExtents = rb->collider.shape.box.halfExtents;
+            float x = 2.0f * halfExtents[0];
+            float y = 2.0f * halfExtents[1];
+            float z = 2.0f * halfExtents[2];
+
+            inertiaTensor[0][0] = (1.0f / 12.0f) * rb->mass * (y*y + z*z);
+            inertiaTensor[1][1] = (1.0f / 12.0f) * rb->mass * (x*x + z*z);
+            inertiaTensor[2][2] = (1.0f / 12.0f) * rb->mass * (x*x + y*y);
+            inertiaTensor[0][1] = inertiaTensor[0][2] = 0.0f;
+            inertiaTensor[1][0] = inertiaTensor[1][2] = 0.0f;
+            inertiaTensor[2][0] = inertiaTensor[2][1] = 0.0f;
+            inertiaTensor[3][3] = 1.0f; // Homojen koordinatlar için
+            break;
+        }
+        case FE_COLLIDER_CAPSULE: {
+            // Kapsül için eylemsizlik tensörü daha karmaşıktır.
+            // Silindir ve iki yarım kürenin birleşimi olarak düşünülebilir.
+            // Basitlik adına, şimdilik bir küre veya kutu gibi davranmasını sağlayabiliriz.
+            // Veya daha gelişmiş bir hesaplama yapabilirsiniz.
+            // Şimdilik basitleştirilmiş bir yaklaşımla sadece küresel bir varsayım yapalım
+            float effectiveRadius = rb->collider.shape.capsule.radius;
+            float effectiveHeight = rb->collider.shape.capsule.height;
+            // Bu sadece bir placeholder, gerçek hesaplama daha karmaşıktır.
+            float I = (2.0f / 5.0f) * rb->mass * (effectiveRadius * effectiveRadius);
+            glm_mat4_identity(inertiaTensor);
+            inertiaTensor[0][0] = I;
+            inertiaTensor[1][1] = I;
+            inertiaTensor[2][2] = I;
+            break;
+        }
+        default:
+            fprintf(stderr, "Uyarı: Bilinmeyen çarpıştırıcı tipi için eylemsizlik tensörü hesaplanamıyor.\n");
+            glm_mat4_identity(inertiaTensor); // Varsayılan olarak birim matris
+            break;
+    }
+
+    // Tersini al
+    glm_mat4_inv(inertiaTensor, rb->inverseInertiaTensor);
+}
+
+void feRigidbodyGetTransformMatrix(const FeRigidbody* rb, mat4 outMatrix) {
+    mat4 rotationMatrix;
+    glm_quat_mat4(rb->rotation, rotationMatrix); // Quaternion'dan dönüşüm matrisine
+    glm_mat4_copy(rotationMatrix, outMatrix);
+    glm_mat4_translate(outMatrix, rb->position); // Konumu matrise uygula
+}
+
+
+// --- Çarpışma Tespit Fonksiyonları ---
+// Bunlar, Broad-Phase'de çağrılan dar faz fonksiyonlarıdır.
+
+bool feDetectCollision_SphereSphere(const FeRigidbody* rbA, const FeRigidbody* rbB, FeCollisionInfo* outInfo) {
+    // Dünya koordinatlarındaki merkez noktaları
+    vec3 centerA, centerB;
+    glm_vec3_add(rbA->position, rbA->collider.localOffset, centerA);
+    glm_vec3_add(rbB->position, rbB->collider.localOffset, centerB);
+
+    vec3 distanceVec;
+    glm_vec3_sub(centerB, centerA, distanceVec);
+    float distanceSq = glm_vec3_norm2(distanceVec); // Mesafenin karesi
+
+    float radiusA = rbA->collider.shape.sphere.radius;
+    float radiusB = rbB->collider.shape.sphere.radius;
+    float radiiSum = radiusA + radiusB;
+    float radiiSumSq = radiiSum * radiiSum;
+
+    if (distanceSq >= radiiSumSq) {
+        return false; // Çarpışma yok
+    }
+
+    // Çarpışma var, bilgileri doldur
+    float distance = sqrtf(distanceSq);
+    outInfo->rbA = (FeRigidbody*)rbA;
+    outInfo->rbB = (FeRigidbody*)rbB;
+    glm_vec3_normalize_to(distanceVec, outInfo->normal); // Normal A'dan B'ye
+    outInfo->penetrationDepth = radiiSum - distance;
+
+    // Temas noktalarını hesapla (basit haliyle)
+    vec3 tempNormalScaled;
+    glm_vec3_scale(outInfo->normal, radiusA, tempNormalScaled);
+    glm_vec3_add(centerA, tempNormalScaled, outInfo->contactPointA); // rbA yüzeyindeki tahmini temas noktası
+
+    glm_vec3_scale(outInfo->normal, -radiusB, tempNormalScaled);
+    glm_vec3_add(centerB, tempNormalScaled, outInfo->contactPointB); // rbB yüzeyindeki tahmini temas noktası
+
+    return true;
+}
+
+bool feDetectCollision_BoxBox(const FeRigidbody* rbA, const FeRigidbody* rbB, FeCollisionInfo* outInfo) {
+    // OBB (Oriented Bounding Box) çarpışması AABB'den daha karmaşıktır.
+    // Separating Axis Theorem (SAT) genellikle OBB çarpışmalarında kullanılır.
+    // Bu fonksiyon sadece bir placeholder. Gerçek bir SAT implementasyonu gerektirir.
+    // Şimdilik hep çarpışma yokmuş gibi davranalım.
+    (void)rbA; // Kullanılmayan parametre uyarısını önlemek için
+    (void)rbB; // Kullanılmayan parametre uyarısını önlemek için
+    (void)outInfo; // Kullanılmayan parametre uyarısını önlemek için
+
+    // TODO: Gerçek OBB-OBB SAT implementasyonu buraya gelecek.
+    // Bu, oldukça karmaşık bir algoritmadır ve bu örnek kapsamına sığmayabilir.
+    // Basit AABB (Axis-Aligned Bounding Box) çakışması daha kolaydır, ancak cisim döndüğünde yanlış sonuçlar verir.
+    // Şimdilik sadece false döndürelim.
+    return false;
+}
+
+bool feDetectCollision_SphereBox(const FeRigidbody* rbA, const FeRigidbody* rbB, FeCollisionInfo* outInfo) {
+    // Sphere-Box (Küre-Kutu) çarpışması için temel bir algoritma:
+    // 1. Kürenin merkezini kutunun yerel (local) uzayına dönüştür.
+    // 2. Kürenin yerel uzaydaki en yakın noktasını kutunun sınırları içinde sıkıştır (clamp).
+    // 3. Sıkıştırılmış nokta ile küre merkezi arasındaki mesafeyi kontrol et.
+
+    // Not: rbA küre, rbB kutu olmalıdır (Broad-phase'de bu sağlanıyor)
+    vec3 sphereCenterWorld;
+    glm_vec3_add(rbA->position, rbA->collider.localOffset, sphereCenterWorld);
+
+    // Kutunun dünya uzayındaki dönüş matrisini al
+    mat4 boxRotationMat;
+    glm_quat_mat4(rbB->rotation, boxRotationMat);
+
+    // Kürenin merkezini kutunun yerel uzayına dönüştür
+    vec3 sphereCenterLocal;
+    vec3 tempVec;
+    glm_vec3_sub(sphereCenterWorld, rbB->position, tempVec); // Kutunun orijinine göre küre merkezi
+    mat4 boxRotationInvMat;
+    glm_mat4_transpose(boxRotationMat, boxRotationInvMat); // Dönüş matrisinin tersi transpozesidir
+    glm_mat4_mulv3(boxRotationInvMat, tempVec, 0.0f, sphereCenterLocal); // Sadece dönüşümü uygula
+
+
+    vec3 closestPointInBox;
+    vec3 boxHalfExtents = rbB->collider.shape.box.halfExtents;
+
+    // Kürenin merkezini kutunun sınırları içine sıkıştır
+    closestPointInBox[0] = fmaxf(-boxHalfExtents[0], fminf(sphereCenterLocal[0], boxHalfExtents[0]));
+    closestPointInBox[1] = fmaxf(-boxHalfExtents[1], fminf(sphereCenterLocal[1], boxHalfExtents[1]));
+    closestPointInBox[2] = fmaxf(-boxHalfExtents[2], fminf(sphereCenterLocal[2], boxHalfExtents[2]));
+
+    // Sıkıştırılmış nokta ile küre merkezi arasındaki vektör
+    vec3 distVecLocal;
+    glm_vec3_sub(sphereCenterLocal, closestPointInBox, distVecLocal);
+    float distanceSq = glm_vec3_norm2(distVecLocal);
+    float sphereRadius = rbA->collider.shape.sphere.radius;
+    float sphereRadiusSq = sphereRadius * sphereRadius;
+
+    if (distanceSq >= sphereRadiusSq) {
+        return false; // Çarpışma yok
+    }
+
+    // Çarpışma var, bilgileri doldur
+    outInfo->rbA = (FeRigidbody*)rbA; // Sphere
+    outInfo->rbB = (FeRigidbody*)rbB; // Box
+
+    float distance = sqrtf(distanceSq);
+    outInfo->penetrationDepth = sphereRadius - distance;
+
+    // Çarpışma normalini ve temas noktalarını dünya uzayına dönüştür
+    if (distance == 0.0f) { // Merkez kutunun tam içindeyse, varsayılan bir normal ata
+        // En az penetrasyon eksenini bulmaya çalışabiliriz
+        glm_vec3_copy((vec3){0.0f, 1.0f, 0.0f}, outInfo->normal); // Varsayılan olarak yukarı
+    } else {
+        vec3 normalLocal;
+        glm_vec3_normalize_to(distVecLocal, normalLocal);
+        glm_mat4_mulv3(boxRotationMat, normalLocal, 0.0f, outInfo->normal); // Kutunun dönüşünü uygula
+    }
+
+    // Temas noktalarını hesapla
+    vec3 tempScaledNormal;
+    glm_vec3_scale(outInfo->normal, sphereRadius - outInfo->penetrationDepth, tempScaledNormal); // Penetrasyon dışındaki kısım
+    glm_vec3_add(sphereCenterWorld, tempScaledNormal, outInfo->contactPointA); // Küre yüzeyindeki temas noktası (tahmini)
+
+    // Kutunun yüzeyindeki temas noktası (en yakın nokta)
+    glm_mat4_mulv3(boxRotationMat, closestPointInBox, 0.0f, tempVec); // Local'den World'e
+    glm_vec3_add(rbB->position, tempVec, outInfo->contactPointB);
+
+    return true;
+}
+
+
+// --- Çarpışma Çözümleme Fonksiyonu ---
+
+void feResolveCollision(FeCollisionInfo* collision) {
+    FeRigidbody* rbA = collision->rbA;
+    FeRigidbody* rbB = collision->rbB;
+
+    // Statik nesneler çözülmez
+    if (rbA->isStatic && rbB->isStatic) return;
+
+    // Göreceli kapanma hızı (relative closing velocity) hesapla
+    vec3 relativeVelocity;
+    glm_vec3_sub(rbA->linearVelocity, rbB->linearVelocity, relativeVelocity);
+
+    // Normal boyunca göreceli hız bileşeni
+    float velAlongNormal = glm_vec3_dot(relativeVelocity, collision->normal);
+
+    // Eğer nesneler birbirinden uzaklaşıyorsa, çözümlemeye gerek yok
+    if (velAlongNormal > 0) {
+        return;
+    }
+
+    // Esneklik katsayısı (restitution)
+    // Materyallerin ortalaması alınabilir
+    float e = fminf(rbA->collider.material.restitution, rbB->collider.material.restitution);
+
+    // İmpuls hesaplaması
+    float j = -(1.0f + e) * velAlongNormal;
+    j /= (rbA->inverseMass + rbB->inverseMass); // Basit doğrusal impuls
+
+    vec3 impulse;
+    glm_vec3_scale(collision->normal, j, impulse);
+
+    // Kuvvetleri uygula
+    if (!rbA->isStatic) {
+        glm_vec3_muladds(impulse, rbA->inverseMass, rbA->linearVelocity);
+    }
+    if (!rbB->isStatic) {
+        glm_vec3_muladds(impulse, -rbB->inverseMass, rbB->linearVelocity);
+    }
+
+    // TODO: Açısal impuls ve sürtünme hesaplaması (daha karmaşık)
+    // Bu, temas noktalarına olan uzaklık ve kütle ataleti ile ilgilidir.
+    // collision->contactPointA ve collision->contactPointB kullanılarak torklar hesaplanabilir.
+    // Tangential (teğetsel) hız bileşenleri ve sürtünme katsayıları gereklidir.
 }
